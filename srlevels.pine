@@ -1,0 +1,301 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © drmanalo
+
+//@version=6
+indicator("S/R Levels - Course Rules", "SR Levels", overlay = true, max_lines_count = 60, max_labels_count = 60)
+
+// A level is valid when it has at least three bounces with price clearly moving away between them,
+// more bounces than breaks, and the most recent interaction is a bounce.
+// Round numbers and the absolute high or low are allowed as exceptions.
+// Label format is R or S, the price, then bounces over breaks, for example R 1.3636 17/5
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+const string G_DET = "Detection"
+pivLen      = input.int(5, "Pivot length", minval = 2, group = G_DET, tooltip = "Bars on each side that define a swing high or low")
+tolMult     = input.float(0.3, "Touch tolerance in ATR", minval = 0.05, step = 0.05, group = G_DET, tooltip = "How close a bar must get to the level to count as a test")
+awayMult    = input.float(1.0, "Away distance in ATR", minval = 0.1, step = 0.1, group = G_DET, tooltip = "How far a close must move from the level to count as a clear move away")
+clusterMult = input.float(0.5, "Cluster width in ATR", minval = 0.1, step = 0.1, group = G_DET, tooltip = "Swings closer than this merge into one candidate level")
+minBounces  = input.int(3, "Minimum bounces", minval = 1, group = G_DET)
+maxEach     = input.int(4, "Max levels each side", minval = 1, maxval = 10, group = G_DET)
+minGapMult  = input.float(2.0, "Minimum gap between levels in ATR", minval = 0.0, step = 0.5, group = G_DET, tooltip = "Levels inside the same area of interest are reduced to the strongest one. 0 turns this off")
+histLen     = input.int(5000, "Bars of history to scan", minval = 200, maxval = 20000, group = G_DET, tooltip = "Levels never expire, so scan as far back as performance allows")
+atrLen      = input.int(50, "ATR length", minval = 5, group = G_DET)
+
+const string G_RND = "Round numbers"
+showRound     = input.bool(true, "Check round numbers", group = G_RND)
+roundStepIn   = input.float(0.0, "Round step, 0 means auto", minval = 0.0, group = G_RND, tooltip = "Auto uses a twentieth of the price magnitude, for example 0.05 on GBPUSD and 5 on a 100 to 999 stock")
+roundEach     = input.int(2, "Round numbers each side", minval = 1, maxval = 5, group = G_RND)
+roundOnlyValid = input.bool(true, "Only show round numbers that pass the rules", group = G_RND, tooltip = "When off, nearby round numbers are always drawn as dashed grey lines")
+
+const string G_EXT = "All-time extremes"
+showExtremes = input.bool(false, "Show highest high and lowest low of scanned history", group = G_EXT)
+
+const string G_STY = "Style"
+resColor   = input.color(color.new(#F23645, 0), "Resistance", group = G_STY)
+supColor   = input.color(color.new(#4CAF50, 0), "Support", group = G_STY)
+roundColor = input.color(color.new(color.gray, 0), "Round number only", group = G_STY)
+extColor   = input.color(color.new(color.orange, 0), "All-time extremes", group = G_STY)
+lineWidth  = input.int(2, "Line width", minval = 1, maxval = 4, group = G_STY)
+showLabels = input.bool(true, "Show labels", group = G_STY)
+labelOffset = input.int(3, "Label offset in bars", minval = 0, group = G_STY)
+showAxis   = input.bool(true, "Show price tags on the scale", group = G_STY)
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+type Level
+    float price
+    int   bounces
+    int   breaks
+    bool  testing
+    bool  valid
+    bool  isRound
+    float roundPx
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+// Price format with fixed decimals so round numbers read as 1.3000 rather than 1.3
+priceFmt() =>
+    close > 50 ? "0.00" : close > 5 ? "0.000" : "0.0000"
+
+fmt(float p) =>
+    str.tostring(p, priceFmt())
+
+// Auto round step is one twentieth of the power of ten below price
+autoStep() =>
+    math.pow(10, math.floor(math.log10(close))) / 20
+
+// Replays stored bars oldest to newest and counts bounces and breaks at one level.
+// side is the side price last closed on beyond the away distance.
+// A touch while not engaged starts an interaction and remembers the entry side.
+// The interaction ends when a close moves beyond the away distance.
+// Leaving on the entry side is a bounce, leaving on the other side is a break.
+evalLevel(float lvl, array<float> hs, array<float> ls, array<float> cs, float tol, float away) =>
+    int  side  = 0
+    int  entry = 0
+    bool eng   = false
+    int  bo    = 0
+    int  br    = 0
+    int  lastK = 0
+    int  n     = cs.size()
+    if n > 0
+        for i = 0 to n - 1
+            float d     = cs.get(i) - lvl
+            bool  touch = ls.get(i) <= lvl + tol and hs.get(i) >= lvl - tol
+            if not eng and touch and side != 0
+                eng   := true
+                entry := side
+            if math.abs(d) > away
+                int sd = d > 0 ? 1 : -1
+                if eng
+                    if sd == entry
+                        bo    += 1
+                        lastK := 1
+                    else
+                        br    += 1
+                        lastK := -1
+                    eng := false
+                side := sd
+    [bo, br, lastK, eng]
+
+// ─── Data collection on every bar ─────────────────────────────────────────────
+float atrNow = ta.sma(ta.tr(true), atrLen)
+float ph     = ta.pivothigh(high, pivLen, pivLen)
+float pl     = ta.pivotlow(low, pivLen, pivLen)
+
+var array<float> hs      = array.new<float>()
+var array<float> ls      = array.new<float>()
+var array<float> cs      = array.new<float>()
+var array<float> pivPx   = array.new<float>()
+var array<int>   pivBar  = array.new<int>()
+
+hs.push(high)
+ls.push(low)
+cs.push(close)
+if hs.size() > histLen
+    hs.shift()
+    ls.shift()
+    cs.shift()
+
+if not na(ph)
+    pivPx.push(ph)
+    pivBar.push(bar_index - pivLen)
+if not na(pl)
+    pivPx.push(pl)
+    pivBar.push(bar_index - pivLen)
+// Drop swings that fall outside the scanned history
+while pivBar.size() > 0 and bar_index - pivBar.first() >= histLen
+    pivBar.shift()
+    pivPx.shift()
+
+var array<line>  drawnLines  = array.new<line>()
+var array<label> drawnLabels = array.new<label>()
+
+// Draws one level as a full width line with its label above the line on the right
+drawLevel(Level lv, bool isRes) =>
+    color col  = not lv.valid ? roundColor : isRes ? resColor : supColor
+    string txt = ""
+    if lv.valid
+        txt := (isRes ? "R " : "S ") + fmt(lv.price) + " (" + str.tostring(lv.bounces) + "/" + str.tostring(lv.breaks) + ")"
+        if lv.isRound
+            txt += " + round number"
+        else if not na(lv.roundPx)
+            txt += " + " + fmt(lv.roundPx) + " round"
+        if lv.testing
+            txt += " · testing"
+    else
+        txt := fmt(lv.price) + " round number"
+    line ln = line.new(bar_index - 1, lv.price, bar_index, lv.price, extend = extend.both, color = col, width = lv.valid ? lineWidth : 1, style = lv.valid ? line.style_solid : line.style_dashed)
+    drawnLines.push(ln)
+    if showLabels
+        label lb = label.new(bar_index + labelOffset, lv.price, txt, style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = col, size = size.normal)
+        drawnLabels.push(lb)
+
+// ─── Level calculation and drawing on the last bar only ───────────────────────
+var array<float> rAxis = array.new<float>(4, na)
+var array<float> sAxis = array.new<float>(4, na)
+
+if barstate.islast and not na(atrNow)
+    for ln in drawnLines
+        ln.delete()
+    for lb in drawnLabels
+        lb.delete()
+    drawnLines.clear()
+    drawnLabels.clear()
+
+    float tol      = atrNow * tolMult
+    float away     = atrNow * awayMult
+    float clusterW = atrNow * clusterMult
+
+    // Cluster sorted swing prices into candidate levels
+    array<float> sorted = pivPx.copy()
+    sorted.sort()
+    array<float> cands = array.new<float>()
+    int i = 0
+    while i < sorted.size()
+        float base = sorted.get(i)
+        float acc  = 0.0
+        int   c    = 0
+        int   j    = i
+        while j < sorted.size() and sorted.get(j) - base <= clusterW
+            acc += sorted.get(j)
+            c   += 1
+            j   += 1
+        cands.push(acc / c)
+        i := j
+
+    // Keep only candidates that pass the three course rules
+    array<Level> levels = array.new<Level>()
+    for lvl in cands
+        [bo, br, lastK, eng] = evalLevel(lvl, hs, ls, cs, tol, away)
+        if bo >= minBounces and bo > br and lastK == 1
+            levels.push(Level.new(lvl, bo, br, eng, true, false, na))
+
+    // Round number exception
+    if showRound
+        float step = roundStepIn > 0 ? roundStepIn : autoStep()
+        float baseRound = math.floor(close / step) * step
+        for k = 1 - roundEach to roundEach
+            float rp = baseRound + k * step
+            [bo, br, lastK, eng] = evalLevel(rp, hs, ls, cs, tol, away)
+            bool ok = bo >= minBounces and bo > br and lastK == 1
+            if ok or not roundOnlyValid
+                levels.push(Level.new(rp, bo, br, eng, ok, true, na))
+
+    // Sort by price and merge levels closer than the cluster width.
+    // The level with more bounces survives and a merged round number becomes a tag.
+    array<float> prices = array.new<float>()
+    for lv in levels
+        prices.push(lv.price)
+    array<int> byPrice = prices.sort_indices(order.ascending)
+    array<Level> ded = array.new<Level>()
+    for idx in byPrice
+        Level lv = levels.get(idx)
+        if ded.size() > 0 and lv.price - ded.last().price < clusterW
+            Level prev  = ded.last()
+            bool  keepNew = (lv.valid and not prev.valid) or (lv.valid == prev.valid and lv.bounces > prev.bounces)
+            Level keep  = keepNew ? lv : prev
+            Level other = keepNew ? prev : lv
+            if not keep.isRound and other.isRound
+                keep.roundPx := other.price
+            ded.set(ded.size() - 1, keep)
+        else
+            ded.push(lv)
+
+    // One line per area of interest.
+    // Strongest levels are placed first, valid before round only, then by bounce count.
+    // A weaker level within the minimum gap of a placed one is dropped,
+    // and a dropped round number becomes a tag on the level that absorbed it.
+    if minGapMult > 0 and ded.size() > 1
+        float minGap = atrNow * minGapMult
+        array<float> scores = array.new<float>()
+        for lv in ded
+            scores.push((lv.valid ? 1000000.0 : 0.0) + lv.bounces)
+        array<int> byScore = scores.sort_indices(order.descending)
+        array<Level> spaced = array.new<Level>()
+        for idx in byScore
+            Level lv = ded.get(idx)
+            int nearK = -1
+            for [k, sp] in spaced
+                if math.abs(sp.price - lv.price) < minGap
+                    nearK := k
+                    break
+            if nearK < 0
+                spaced.push(lv)
+            else
+                Level host = spaced.get(nearK)
+                if lv.isRound and not host.isRound and na(host.roundPx)
+                    host.roundPx := lv.price
+        // Back into price order for the support and resistance split
+        array<float> spPrices = array.new<float>()
+        for sp in spaced
+            spPrices.push(sp.price)
+        array<int> spOrder = spPrices.sort_indices(order.ascending)
+        ded.clear()
+        for idx in spOrder
+            ded.push(spaced.get(idx))
+
+    // Split at the current close into resistance above and support below
+    array<Level> res = array.new<Level>()
+    array<Level> sup = array.new<Level>()
+    for lv in ded
+        if lv.price > close
+            if res.size() < maxEach
+                res.push(lv)
+    for k = ded.size() - 1 to 0
+        if ded.size() == 0
+            break
+        Level lv = ded.get(k)
+        if lv.price <= close and sup.size() < maxEach
+            sup.push(lv)
+
+    for k = 0 to 3
+        rAxis.set(k, na)
+        sAxis.set(k, na)
+    for [k, lv] in res
+        drawLevel(lv, true)
+        if k < 4 and lv.valid
+            rAxis.set(k, lv.price)
+    for [k, lv] in sup
+        drawLevel(lv, false)
+        if k < 4 and lv.valid
+            sAxis.set(k, lv.price)
+
+    // Absolute extremes of the scanned history are always valid levels
+    if showExtremes and hs.size() > 0
+        float ath = hs.max()
+        float atl = ls.min()
+        drawnLines.push(line.new(bar_index - 1, ath, bar_index, ath, extend = extend.both, color = extColor, width = lineWidth))
+        drawnLines.push(line.new(bar_index - 1, atl, bar_index, atl, extend = extend.both, color = extColor, width = lineWidth))
+        if showLabels
+            drawnLabels.push(label.new(bar_index + labelOffset, ath, "High " + fmt(ath), style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = extColor))
+            drawnLabels.push(label.new(bar_index + labelOffset, atl, "Low " + fmt(atl), style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = extColor))
+
+// ─── Price scale tags ─────────────────────────────────────────────────────────
+// Values exist only on the last bar so each plot shows just a tag on the price scale
+axisDisplay = showAxis ? display.price_scale : display.none
+plot(rAxis.get(0), "R1", resColor, display = axisDisplay)
+plot(rAxis.get(1), "R2", resColor, display = axisDisplay)
+plot(rAxis.get(2), "R3", resColor, display = axisDisplay)
+plot(rAxis.get(3), "R4", resColor, display = axisDisplay)
+plot(sAxis.get(0), "S1", supColor, display = axisDisplay)
+plot(sAxis.get(1), "S2", supColor, display = axisDisplay)
+plot(sAxis.get(2), "S3", supColor, display = axisDisplay)
+plot(sAxis.get(3), "S4", supColor, display = axisDisplay)
